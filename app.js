@@ -5,9 +5,13 @@ const express = require("express");
 const helmet = require("helmet");
 const cors = require("cors");
 const morgan = require("morgan");
-// ... import middleware, route ทั้งหมดที่มีอยู่เดิมใน index.js ...
+
+const { createStudentSchema } = require("./schemas/studentSchema");
 const { parsePagination, parseSort } = require("./middlewares/query-parser");
 const { authenticateToken, authorizeRole } = require("./middlewares/auth");
+
+// 1. นำเข้า Rate Limiters
+const { authLimiter, generalLimiter } = require("./middlewares/rateLimiter");
 
 const { redisClient } = require("./cache");
 
@@ -33,7 +37,15 @@ app.use(
 app.use(morgan("dev"));
 app.use(express.json({ limit: "10kb" }));
 
-// 2. Base Routes
+// -------------------------------------------------------------------
+// 2. เพิ่มโค้ด Rate Limiter ต่อจาก express.json() และก่อน Route ทั้งหมด
+// -------------------------------------------------------------------
+app.set("trust proxy", 1);
+app.use(generalLimiter);
+app.use("/api/v1/auth/login", authLimiter);
+// -------------------------------------------------------------------
+
+// Base Routes
 app.use("/api/v1", v1Router);
 app.use("/api/v2", v2Router);
 
@@ -85,7 +97,6 @@ v1Router.get(
 v2Router.get("/students", async (req, res, next) => {
   try {
     const [rows] = await pool.query("SELECT * FROM students");
-    // v2 ปรับโครงสร้างผลลัพธ์ใหม่ ไม่มี wrapper "message" เหมือน v1
     res.status(200).json({ items: rows, count: rows.length });
   } catch (err) {
     next(err);
@@ -110,26 +121,36 @@ app.get("/api/v1/students/:id", async (req, res, next) => {
   }
 });
 
+// POST /api/v1/students (ใช้ Zod Validation)
 app.post("/api/v1/students", async (req, res, next) => {
-  const { name, major, email } = req.body;
+  const result = createStudentSchema.safeParse(req.body);
 
-  if (!name || !major || !email) {
+  if (!result.success) {
     return res.status(400).json({
-      error: { code: "VALIDATION_ERROR", message: "กรุณาระบุข้อมูลให้ครบถ้วน" },
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "ข้อมูลที่ส่งมาไม่ถูกต้อง",
+        details: result.error.issues.map((issue) => ({
+          field: issue.path.join("."),
+          message: issue.message,
+        })),
+      },
     });
   }
 
+  const { name, major, email, passportNumber } = result.data;
+
   try {
-    const [result] = await pool.query(
-      "INSERT INTO students (name, major, email) VALUES (?, ?, ?)",
-      [name, major, email],
+    const [dbResult] = await pool.query(
+      "INSERT INTO students (name, major, email, passportNumber) VALUES (?, ?, ?, ?)",
+      [name, major, email, passportNumber || null],
     );
 
-    await redisClient.del("students:all"); // ล้างแคชเนื่องจากข้อมูลเปลี่ยนแปลงแล้ว
+    await redisClient.del("students:all");
 
     res.status(201).json({
       message: "เพิ่มข้อมูลสำเร็จ",
-      data: { id: result.insertId, name, major, email },
+      data: { id: dbResult.insertId, name, major, email, passportNumber },
     });
   } catch (err) {
     if (err.code === "ER_DUP_ENTRY") {
@@ -224,7 +245,6 @@ app.delete(
   },
 );
 
-// เพิ่ม route ใหม่: เฉพาะผู้ที่ล็อกอินแล้วเท่านั้นที่ดูข้อมูลของตนเองได้
 app.get("/api/v1/auth/me", authenticateToken, (req, res) => {
   res.status(200).json({ message: "สำเร็จ", data: req.user });
 });
@@ -307,7 +327,7 @@ app.post("/api/v1/auth/login", async (req, res, next) => {
   }
 });
 
-// Error handling middleware (จากสัปดาห์ที่ 4)
+// Centralized Error Handling
 app.use((err, req, res, next) => {
   console.error(err);
   res.status(500).json({
